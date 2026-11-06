@@ -22,10 +22,16 @@ class Reclaimer {
     // Takes `plan`'s replicas off the object `hold` holds, under that write
     // lock, which it neither lets go nor uses to reach the route. `so_far` is
     // what the run has done before this object. An error, from an OpLog
-    // write, means nothing was taken and the run stops.
+    // write, means nothing was taken. Admission backpressure may be
+    // retried after WaitForCapacity; other errors stop the run.
     [[nodiscard]] virtual tl::expected<Effect, ErrorCode> Apply(
         metadata::Namespace& ns, const route::WriteGuard& hold,
         const Plan& plan, const Report& so_far) = 0;
+    // Called without a key lock after admission fails. OK retries the
+    // same publication with a fresh eligibility check; an error stops the run.
+    virtual ErrorCode WaitForCapacity() {
+        return ErrorCode::TASK_PENDING_LIMIT_EXCEEDED;
+    }
     // Tears down the object `hold` holds, which reclaiming left with nothing
     // valid, under the lock Apply ran under.
     virtual void TearDown(metadata::Namespace& ns,

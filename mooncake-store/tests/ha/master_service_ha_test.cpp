@@ -6955,7 +6955,7 @@ TEST_F(MasterServiceHATest, NoFBatchEvictReleasesNoFSpaceAfterDurable) {
 #endif
 
 TEST_F(MasterServiceHATest,
-       BatchEvictQueueSaturationDoesNotRequestAnotherPass) {
+       BatchEvictWaitsForCapacityAndFinalizesOnlyAfterDurability) {
     const std::string cluster_id = "test_batch_evict_reservation_failure";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
@@ -6985,34 +6985,23 @@ TEST_F(MasterServiceHATest,
     ASSERT_TRUE(writer->PauseCallbacksAfter(batch.last_seq));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    {
-        auto held_reservation = ReserveBatchSlotForTesting(service);
-        ASSERT_TRUE(held_reservation.has_value())
-            << toString(held_reservation.error());
-        SetNeedMemEvictionForTesting(service, true);
+    auto held_reservation = ReserveBatchSlotForTesting(service);
+    ASSERT_TRUE(held_reservation.has_value());
+    SetNeedMemEvictionForTesting(service, true);
+    auto eviction = std::async(std::launch::async, [&] {
+        MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 1.0);
+    });
+    EXPECT_EQ(eviction.wait_for(std::chrono::milliseconds(150)),
+              std::future_status::timeout);
+    EXPECT_EQ(1u, ReplicaCountForTesting(service, kDefaultTenant, first_key));
+    EXPECT_EQ(1u, ReplicaCountForTesting(service, kDefaultTenant, second_key));
 
-        ::testing::internal::CaptureStderr();
-        MasterServiceTestPeer(service).RunBatchEvictForTesting(
-            /*evict_ratio_target=*/0.5,
-            /*evict_ratio_lowerbound=*/0.5);
-        const std::string logs = ::testing::internal::GetCapturedStderr();
-        const std::string warning = "OpLog reservation failed";
-        const auto first_warning = logs.find(warning);
-        ASSERT_NE(std::string::npos, first_warning) << logs;
-        EXPECT_EQ(std::string::npos,
-                  logs.find(warning, first_warning + warning.size()))
-            << logs;
-        EXPECT_NE(std::string::npos, logs.find("err=-1401")) << logs;
-        EXPECT_FALSE(NeedMemEvictionForTesting(service));
-        EXPECT_EQ(1u,
-                  ReplicaCountForTesting(service, kDefaultTenant, first_key));
-        EXPECT_EQ(1u,
-                  ReplicaCountForTesting(service, kDefaultTenant, second_key));
-    }
-
-    MasterServiceTestPeer(service).RunBatchEvictForTesting(
-        /*evict_ratio_target=*/1.0,
-        /*evict_ratio_lowerbound=*/1.0);
+    writer->Abort(std::move(*held_reservation));
+    const auto status = eviction.wait_for(std::chrono::seconds(2));
+    if (status != std::future_status::ready) service.StopBatchOpLogWriter();
+    ASSERT_EQ(status, std::future_status::ready);
+    eviction.get();
+    EXPECT_FALSE(NeedMemEvictionForTesting(service));
     ReadBatchEventually(storage, 4, batch);
     ReadBatchEventually(storage, 5, batch);
     EXPECT_EQ(1u, ReplicaCountForTesting(service, kDefaultTenant, first_key));

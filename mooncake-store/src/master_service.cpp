@@ -272,10 +272,15 @@ struct MasterService::MemoryEviction {
             // consumed reservation cannot strand REMOVED replicas.
             auto reservation = service_.ReserveBatchOpLogSlot();
             if (!reservation) {
-                LOG(WARNING)
-                    << "Eviction: OpLog reservation failed for key=" << key
-                    << ", err=" << static_cast<int>(reservation.error())
-                    << ", stopping eviction scan";
+                if (reservation.error() !=
+                        ErrorCode::TASK_PENDING_LIMIT_EXCEEDED &&
+                    reservation.error() !=
+                        ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+                    LOG(WARNING)
+                        << "Eviction: OpLog reservation failed for key=" << key
+                        << ", err=" << static_cast<int>(reservation.error())
+                        << ", stopping eviction scan";
+                }
                 return tl::make_unexpected(reservation.error());
             }
             std::vector<ReplicaID> removed_ids;
@@ -312,6 +317,10 @@ struct MasterService::MemoryEviction {
             effect.outcome = remaining.empty() ? eviction::Outcome::kDropped
                                                : eviction::Outcome::kDemoted;
             return effect;
+        }
+
+        ErrorCode WaitForCapacity() override {
+            return service_.ordered_oplog_writer_->WaitForCapacity();
         }
 
         // The durable finalize tears the object down, so Apply never asks.

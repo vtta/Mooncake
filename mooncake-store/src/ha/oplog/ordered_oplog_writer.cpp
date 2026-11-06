@@ -293,6 +293,23 @@ OrderedOpLogWriter::ReserveBatch(size_t entry_count) {
     return Reservation(this, id, entry_count);
 }
 
+ErrorCode OrderedOpLogWriter::WaitForCapacity() {
+    std::unique_lock<std::mutex> lock(impl_->mutex);
+    impl_->cv.wait(lock, [this] {
+        return !impl_->running || impl_->stop_requested ||
+               impl_->terminal_state.has_value() ||
+               (impl_->accepting && impl_->open_waiting_slots <
+                                        impl_->config.max_entries_per_batch);
+    });
+    if (impl_->terminal_state.has_value()) {
+        return impl_->terminal_state->error;
+    }
+    if (!impl_->running || impl_->stop_requested) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    return ErrorCode::OK;
+}
+
 tl::expected<OrderedOpLogWriter::PendingHandle, ErrorCode>
 OrderedOpLogWriter::Commit(Reservation&& reservation, OpLogEntry entry,
                            DurableCallback callback) {
@@ -308,6 +325,7 @@ OrderedOpLogWriter::Commit(Reservation&& reservation, OpLogEntry entry,
         reservation.id_ = 0;
         reservation.slots_ = 0;
         impl_->PublishRuntime();
+        impl_->cv.notify_all();
         return tl::make_unexpected(error);
     };
     if (impl_->terminal_state.has_value()) {
@@ -360,6 +378,7 @@ OrderedOpLogWriter::CommitBatch(Reservation&& reservation,
         reservation.id_ = 0;
         reservation.slots_ = 0;
         impl_->PublishRuntime();
+        impl_->cv.notify_all();
         return tl::make_unexpected(error);
     };
     if (entries.empty() || entries.size() != reservation.slots_) {
@@ -417,6 +436,7 @@ void OrderedOpLogWriter::Abort(Reservation&& reservation) {
     reservation.id_ = 0;
     reservation.slots_ = 0;
     impl_->PublishRuntime();
+    impl_->cv.notify_all();
 }
 
 async_simple::Future<ErrorCode> OrderedOpLogWriter::AwaitDurable(

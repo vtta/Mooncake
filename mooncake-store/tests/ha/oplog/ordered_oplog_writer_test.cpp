@@ -321,6 +321,132 @@ class OrderedOpLogWriterAwaitTest : public ::testing::Test {
 
 }  // namespace
 
+class OrderedOpLogWriterCapacityTest : public OrderedOpLogWriterAwaitTest {
+   protected:
+    void StartWaiting() {
+        capacity_ = std::async(std::launch::async,
+                               [this] { return writer_->WaitForCapacity(); });
+        EXPECT_EQ(capacity_.wait_for(std::chrono::milliseconds(20)),
+                  std::future_status::timeout);
+    }
+
+    void ExpectCapacity(ErrorCode error) {
+        const auto status = capacity_.wait_for(std::chrono::seconds(2));
+        if (status != std::future_status::ready) {
+            storage_.UnblockWrites();
+            writer_->Stop();
+        }
+        EXPECT_EQ(status, std::future_status::ready);
+        EXPECT_EQ(capacity_.get(), error);
+    }
+
+    void TearDown() override {
+        OrderedOpLogWriterAwaitTest::TearDown();
+        if (capacity_.valid()) capacity_.get();
+    }
+
+    std::future<ErrorCode> capacity_;
+};
+
+TEST_F(OrderedOpLogWriterCapacityTest, AbortingAReservationWakesWaiters) {
+    CreateWriter({.max_entries_per_batch = 1});
+    writer_->Start();
+    auto held = writer_->Reserve();
+    ASSERT_TRUE(held.has_value());
+    StartWaiting();
+    writer_->Abort(std::move(*held));
+    ExpectCapacity(ErrorCode::OK);
+    EXPECT_TRUE(writer_->Reserve().has_value());
+}
+
+TEST_F(OrderedOpLogWriterCapacityTest, RejectedCommitsWakeWaiters) {
+    for (bool batch : {false, true}) {
+        CreateWriter({.max_entries_per_batch = 1});
+        writer_->Start();
+        auto held = writer_->Reserve();
+        ASSERT_TRUE(held.has_value());
+        StartWaiting();
+        if (batch) {
+            EXPECT_FALSE(
+                writer_->CommitBatch(std::move(*held), {}, {}).has_value());
+        } else {
+            auto invalid = MakeEntry();
+            invalid.tenant_id = "_reserved";
+            EXPECT_FALSE(
+                writer_->Commit(std::move(*held), std::move(invalid), {})
+                    .has_value());
+        }
+        ExpectCapacity(ErrorCode::OK);
+        writer_->Stop();
+    }
+}
+
+TEST_F(OrderedOpLogWriterCapacityTest, ALongTransactionPausesRatherThanAborts) {
+    CreateWriter({.max_entries_per_batch = 1});
+    storage_.BlockWrites();
+    writer_->Start();
+    auto first = writer_->Reserve();
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(
+        writer_->Commit(std::move(*first), MakeEntry("first"), {}).has_value());
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+    auto second = writer_->Reserve();
+    ASSERT_TRUE(second.has_value());
+    ASSERT_TRUE(writer_->Commit(std::move(*second), MakeEntry("second"), {})
+                    .has_value());
+    StartWaiting();
+    EXPECT_EQ(capacity_.wait_for(std::chrono::milliseconds(150)),
+              std::future_status::timeout);
+    storage_.UnblockWrites();
+    ExpectCapacity(ErrorCode::OK);
+    EXPECT_TRUE(storage_.WaitForWrites(2));
+}
+
+TEST_F(OrderedOpLogWriterCapacityTest, BackendRetryRecoveryWakesWaiters) {
+    CreateWriter({.max_entries_per_batch = 1});
+    storage_.FailNextWrites(100000, ErrorCode::ETCD_OPERATION_ERROR);
+    writer_->Start();
+    auto held = writer_->Reserve();
+    ASSERT_TRUE(held.has_value());
+    ASSERT_TRUE(writer_->Commit(std::move(*held), MakeEntry(), {}).has_value());
+    ASSERT_TRUE(storage_.WaitForAttempts(2));
+    ASSERT_FALSE(writer_->IsAccepting());
+    StartWaiting();
+    storage_.AllowWrites();
+    ExpectCapacity(ErrorCode::OK);
+}
+
+TEST_F(OrderedOpLogWriterCapacityTest,
+       FencingWakesWaitersWithTheTerminalError) {
+    CreateWriter({.max_entries_per_batch = 1});
+    storage_.BlockWrites();
+    storage_.FailNextWrite(ErrorCode::ETCD_TRANSACTION_FAIL);
+    writer_->Start();
+    auto first = writer_->Reserve();
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(
+        writer_->Commit(std::move(*first), MakeEntry(), {}).has_value());
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+    auto held = writer_->Reserve();
+    ASSERT_TRUE(held.has_value());
+    StartWaiting();
+    storage_.UnblockWrites();
+    ExpectCapacity(ErrorCode::ETCD_TRANSACTION_FAIL);
+}
+
+TEST_F(OrderedOpLogWriterCapacityTest,
+       StopWakesWaitersWithoutFreeingTheirSlot) {
+    CreateWriter({.max_entries_per_batch = 1});
+    EXPECT_EQ(writer_->WaitForCapacity(),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    writer_->Start();
+    auto held = writer_->Reserve();
+    ASSERT_TRUE(held.has_value());
+    StartWaiting();
+    writer_->Stop();
+    ExpectCapacity(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
 TEST_F(OrderedOpLogWriterAwaitTest,
        RestoredPrefixSucceedsBeforeStartAndAfterStop) {
     CreateWriter({.initial_durable_prefix = {.batch_id = 2, .last_seq = 10}});

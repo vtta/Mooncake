@@ -72,7 +72,7 @@ class FakeReclaimer final : public eviction::Reclaimer {
         metadata::Namespace& ns, const route::WriteGuard& hold,
         const eviction::Plan& plan, const eviction::Report&) override {
         if (static_cast<int>(applies++) == fail_at) {
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            return tl::make_unexpected(fail_error);
         }
         if (on_apply) {
             on_apply(ns, hold.key());
@@ -95,7 +95,15 @@ class FakeReclaimer final : public eviction::Reclaimer {
         hold.TearDown();
     }
 
+    ErrorCode WaitForCapacity() override {
+        ++waits;
+        return on_wait ? on_wait() : ErrorCode::TASK_PENDING_LIMIT_EXCEEDED;
+    }
+
     int fail_at = -1;
+    ErrorCode fail_error = ErrorCode::INTERNAL_ERROR;
+    std::function<ErrorCode()> on_wait;
+    size_t waits = 0;
     std::function<void(metadata::Namespace&, const std::string&)> on_apply;
     size_t applies = 0;
     std::vector<std::string> applied;
@@ -409,6 +417,103 @@ TEST_F(EvictorTest, AFailedReclaimStopsTheRun) {
     EXPECT_TRUE(report.stopped);
     EXPECT_EQ(reclaimer_.applied, std::vector<std::string>{"k1"});
     EXPECT_EQ(reclaimer_.applies, 2u);
+}
+
+// Exercise both the initial walk and deferred group fallback. Retrying
+// must not resubmit an earlier member or finish with a new eviction run.
+TEST_F(EvictorTest, BackpressureResumesTheSameGroupAndRun) {
+    for (bool fallback : {false, true}) {
+        for (ErrorCode error : {ErrorCode::TASK_PENDING_LIMIT_EXCEEDED,
+                                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS}) {
+            Publish("a", "g1", seconds(10), "g");
+            Publish("a", "g2", seconds(10), "g");
+            Publish("a", "g3", seconds(10), "g");
+            policy_.soft_pinned = fallback
+                                      ? std::set<std::string>{"g1", "g2", "g3"}
+                                      : std::set<std::string>{};
+            policy_.defer_soft_pinned = fallback;
+            reclaimer_.applied.clear();
+            reclaimer_.fail_at = reclaimer_.applies + 1;
+            reclaimer_.fail_error = error;
+            const auto waits = reclaimer_.waits;
+            reclaimer_.on_wait = [this, waits] {
+                // Another producer can consume capacity before we reserve it.
+                if (reclaimer_.waits < waits + 3) {
+                    reclaimer_.fail_at = reclaimer_.applies;
+                }
+                return ErrorCode::OK;
+            };
+            const auto runs = observer_.runs;
+
+            const auto report =
+                Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+
+            EXPECT_FALSE(report.stopped);
+            EXPECT_EQ(report.evicted_objects, 3u);
+            EXPECT_EQ(reclaimer_.applied.size(), 3u);
+            EXPECT_EQ(std::set<std::string>(reclaimer_.applied.begin(),
+                                            reclaimer_.applied.end()),
+                      (std::set<std::string>{"g1", "g2", "g3"}));
+            EXPECT_EQ(reclaimer_.waits, waits + 3);
+            EXPECT_EQ(observer_.runs, runs + 1);
+        }
+    }
+}
+
+TEST_F(EvictorTest, BackpressureReleasesTheKeyLockAndRechecksTheLease) {
+    Publish("a", "k1", seconds(10));
+    Publish("a", "k2", seconds(8));
+    reclaimer_.fail_at = 0;
+    reclaimer_.fail_error = ErrorCode::TASK_PENDING_LIMIT_EXCEEDED;
+    reclaimer_.on_wait = [this] {
+        auto hold = namespaces_.GetOrCreate(TenantId("a")).objects.Read("k1");
+        EXPECT_TRUE(hold.has_value());
+        SetDeadline(hold->metadata(), Clock::now() + std::chrono::hours(1));
+        return ErrorCode::OK;
+    };
+
+    const auto report = Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+
+    EXPECT_FALSE(report.stopped);
+    EXPECT_EQ(reclaimer_.applied, std::vector<std::string>{"k2"});
+    EXPECT_EQ(reclaimer_.waits, 1u);
+}
+
+TEST_F(EvictorTest, BackpressureDoesNotEvictAReplacementWithTheSameDeadline) {
+    const auto deadline = Clock::now() - seconds(10);
+    PublishAt("a", "k", deadline);
+    reclaimer_.fail_at = 0;
+    reclaimer_.fail_error = ErrorCode::TASK_PENDING_LIMIT_EXCEEDED;
+    reclaimer_.on_wait = [this, deadline] {
+        {
+            auto hold =
+                namespaces_.GetOrCreate(TenantId("a")).objects.Write("k");
+            hold->TearDown();
+        }
+        PublishAt("a", "k", deadline);
+        return ErrorCode::OK;
+    };
+
+    const auto report = Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+
+    EXPECT_FALSE(report.stopped);
+    EXPECT_TRUE(reclaimer_.applied.empty());
+    EXPECT_TRUE(namespaces_.GetOrCreate(TenantId("a")).objects.Contains("k"));
+}
+
+TEST_F(EvictorTest, BackpressureStopsWhenWaitingFails) {
+    Publish("a", "k", seconds(10));
+    reclaimer_.fail_at = 0;
+    reclaimer_.fail_error = ErrorCode::TASK_PENDING_LIMIT_EXCEEDED;
+    reclaimer_.on_wait = [] {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    };
+
+    const auto report = Run(ObjectGoal{.target_ratio = 1.0, .min_ratio = 1.0});
+
+    EXPECT_TRUE(report.stopped);
+    EXPECT_TRUE(reclaimer_.applied.empty());
+    EXPECT_EQ(reclaimer_.waits, 1u);
 }
 
 TEST_F(EvictorTest, AGroupGoesTogetherByItsSharedLease) {

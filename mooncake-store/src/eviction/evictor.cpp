@@ -114,18 +114,33 @@ class Evictor::Pass {
     // no entry, in the fallback, and frees what that took once the lock is
     // let go.
     void Evict(std::optional<route::WriteGuard> hold, const Entry* entry) {
-        if (!hold) {
-            return;
+        while (hold) {
+            auto detached = EvictLocked(*hold, entry);
+            if (detached) {
+                // Free detached replicas only after releasing the key lock.
+                hold.reset();
+                return;
+            }
+            const route::ObjectRef ref = hold->ref();
+            hold.reset();
+            if ((detached.error() != ErrorCode::TASK_PENDING_LIMIT_EXCEEDED &&
+                 detached.error() !=
+                     ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) ||
+                evictor_.reclaimer_.WaitForCapacity() != ErrorCode::OK) {
+                report_.stopped = true;
+                return;
+            }
+            // A read, replacement or removal may have happened while waiting.
+            if (auto current = ns_.objects.Write(ref)) {
+                hold.emplace(std::move(*current));
+            }
         }
-        // Freed as this returns, after the lock is let go.
-        const std::vector<Replica> detached = EvictLocked(*hold, entry);
-        hold.reset();
     }
 
     // Reclaims the object `hold` holds if it qualifies, tears it down if that
     // left it nothing valid, and returns the replicas it took.
-    std::vector<Replica> EvictLocked(const route::WriteGuard& hold,
-                                     const Entry* entry) {
+    tl::expected<std::vector<Replica>, ErrorCode> EvictLocked(
+        const route::WriteGuard& hold, const Entry* entry) {
         // Filed ahead of its real rank: letting the lock go files it there,
         // where the walk meets it in its turn.
         if (entry != nullptr && !cursor_->StillAt(hold, *entry)) {
@@ -138,8 +153,7 @@ class Evictor::Pass {
         }
         auto effect = evictor_.reclaimer_.Apply(ns_, hold, *plan, report_);
         if (!effect) {
-            report_.stopped = true;
-            return {};
+            return tl::make_unexpected(effect.error());
         }
         report_.Add(*effect);
         const ObjectView view{ns_.id(), hold.key(), hold.metadata()};

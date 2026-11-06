@@ -60,6 +60,7 @@ class OffloadingReclaimer final : public Reclaimer {
                                           const route::WriteGuard& hold,
                                           const Plan& plan,
                                           const Report& so_far) override;
+    ErrorCode WaitForCapacity() override { return inner_.WaitForCapacity(); }
     void TearDown(metadata::Namespace& ns,
                   const route::WriteGuard& hold) override {
         inner_.TearDown(ns, hold);
